@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import AnyLanguageModel
@@ -17,11 +18,17 @@ struct AnyOfGenerationTests {
     private let one = 6
     private let eos = 50
 
-    private func generate(_ schema: GenerationSchema, sampling queue: [Int]) async throws -> String {
+    /// - Parameter decodedText: Overrides the text a token decodes to, as for a piece with a
+    ///   leading space that still tokenizes from the bare text.
+    private func generate(
+        _ schema: GenerationSchema,
+        sampling queue: [Int],
+        decodedText: [Int: String] = [:]
+    ) async throws -> String {
         let tokenToText: [Int: String] = [
             quote: "\"", comma: ",", rightBrace: "}", 3: "]", colon: ":",
             a: "a", b: "b", x: "x", y: "y", leftBrace: "{", null: "null", one: "1", eos: "<eos>",
-        ]
+        ].merging(decodedText) { $1 }
         let textToTokens: [String: [Int]] = [
             "\"": [quote], ",": [comma], "}": [rightBrace], ":": [colon], "{": [leftBrace],
             "a": [a], "b": [b], "x": [x], "y": [y], "1": [one], "null": [null],
@@ -121,7 +128,80 @@ struct AnyOfGenerationTests {
     }
 
     @Test func discriminatedUnionCanPickThePayloadlessCase() async throws {
-        #expect(try await generate(discriminatedUnion(), sampling: [quote, x, quote, colon, a]) == #"{"x":"a"}"#)
+        // The payloadless case comes second, so declaration order alone can't pick it.
+        let schema = GenerationSchema.primitive(
+            String.self,
+            node: .anyOf([
+                object(["x": letter(["b"]), "y": letter(["a"])]),
+                object(["x": letter(["a"])]),
+            ])
+        )
+        #expect(try await generate(schema, sampling: [quote, x, quote, colon, a]) == #"{"x":"a"}"#)
+    }
+
+    @Test func choiceThatDecodesDifferentlyKeepsTheRemainingKeys() async throws {
+        // The token for "b" decodes as " b", so the value matches no choice exactly. The
+        // object must not close before `y`, which the case named "b" requires.
+        let queue = [quote, x, quote, colon, b, comma, quote, y, quote, colon, a]
+        let output = try await generate(discriminatedUnion(), sampling: queue, decodedText: [b: " b"])
+        #expect(output == #"{"x":" b","y":"a"}"#)
+    }
+
+    @Test func sharedKeyWithObjectValuesFollowsTheNestedKeys() async throws {
+        // Both values of `x` start with `{`, so the nested key picks the second variant,
+        // which then requires `y`.
+        let schema = GenerationSchema.primitive(
+            String.self,
+            node: .anyOf([
+                object(["x": object(["x": letter(["a"])])]),
+                object(["x": object(["y": letter(["a"])]), "y": letter(["a"])]),
+            ])
+        )
+        let queue = [quote, x, quote, colon, quote, y, quote, colon, a, comma, quote, y, quote, colon, a]
+        #expect(try await generate(schema, sampling: queue) == #"{"x":{"y":"a"},"y":"a"}"#)
+    }
+
+    @Test func sharedKeysWhoseReferencesDifferOnlyInDescriptionKeepBothVariants() async throws {
+        // `x` refers to `A` in one variant and `B` in the other, two integers that differ
+        // only in their descriptions, so emitting `x` must not decide the union.
+        let json = #"""
+            {
+              "$defs": {
+                "A": {"type": "integer", "description": "first"},
+                "B": {"type": "integer", "description": "second"}
+              },
+              "anyOf": [
+                {"type": "object", "properties": {"x": {"$ref": "#/$defs/A"}}, "required": ["x"]},
+                {
+                  "type": "object",
+                  "properties": {"x": {"$ref": "#/$defs/B"}, "y": {"type": "string", "enum": ["a"]}},
+                  "required": ["x", "y"]
+                }
+              ]
+            }
+            """#
+        let schema = try JSONDecoder().decode(GenerationSchema.self, from: Data(json.utf8))
+        let queue = [quote, x, quote, colon, one, comma, comma, quote, y, quote, colon, a]
+        #expect(try await generate(schema, sampling: queue) == #"{"x":1,"y":"a"}"#)
+    }
+
+    @Test func selfReferencingSharedKeysStillGenerate() async throws {
+        // `A` and `B` each refer to themselves, so comparing them must stop expanding.
+        let json = #"""
+            {
+              "$defs": {
+                "A": {"type": "object", "properties": {"x": {"$ref": "#/$defs/A"}}, "required": []},
+                "B": {"type": "object", "properties": {"y": {"$ref": "#/$defs/B"}}, "required": []}
+              },
+              "anyOf": [
+                {"type": "object", "properties": {"x": {"$ref": "#/$defs/A"}}, "required": ["x"]},
+                {"type": "object", "properties": {"x": {"$ref": "#/$defs/B"}}, "required": ["x"]}
+              ]
+            }
+            """#
+        let schema = try JSONDecoder().decode(GenerationSchema.self, from: Data(json.utf8))
+        let queue = [quote, x, quote, colon, rightBrace]
+        #expect(try await generate(schema, sampling: queue) == #"{"x":{}}"#)
     }
 
     @Test func constantGuidedDiscriminatorPicksTheCase() async throws {
