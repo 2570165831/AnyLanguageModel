@@ -147,6 +147,15 @@ struct AnyOfGenerationTests {
         #expect(output == #"{"x":" b","y":"a"}"#)
     }
 
+    @Test func choiceThatDecodesDifferentlyCannotCloseBeforeTheRemainingKeys() async throws {
+        // The sampled token is still the choice "b", so its case stays the only one live and
+        // `}` isn't offered before `y`. Scripting `}` there must be refused, not followed.
+        let queue = [quote, x, quote, colon, b, rightBrace]
+        await #expect(throws: ConstrainedGenerationError.self) {
+            try await generate(discriminatedUnion(), sampling: queue, decodedText: [b: " b"])
+        }
+    }
+
     @Test func sharedKeyWithObjectValuesFollowsTheNestedKeys() async throws {
         // Both values of `x` start with `{`, so the nested key picks the second variant,
         // which then requires `y`.

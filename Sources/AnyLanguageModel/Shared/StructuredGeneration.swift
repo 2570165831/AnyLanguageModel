@@ -244,6 +244,18 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
     }
 
     private mutating func generateChoice(_ candidates: [String]) async throws -> String {
+        try await generateIndexedChoice(candidates).text
+    }
+
+    /// Generates one of `candidates`.
+    ///
+    /// - Returns: The text the sampled tokens decode to, and the position in `candidates` of
+    ///   the choice they spell, or `nil` when the budget runs out before one is complete.
+    ///   The text can differ from the choice when a token's text differs from the text it
+    ///   was tokenized from, like a piece with a leading space; the position doesn't.
+    private mutating func generateIndexedChoice(
+        _ candidates: [String]
+    ) async throws -> (text: String, index: Int?) {
         guard !candidates.isEmpty else {
             throw ConstrainedGenerationError.tokenizationFailed
         }
@@ -263,20 +275,20 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
             if !chosen.isEmpty {
                 _ = try await emit(chosen)
             }
-            return chosen
+            return (chosen, candidates.firstIndex(of: chosen))
         }
 
-        var prefixes = tokenized
+        var prefixes = Array(tokenized.indices)
         var emitted = ""
         var position = 0
 
         while backend.remainingTokens > 0 {
-            if prefixes.contains(where: { $0.count == position }) { break }
+            if prefixes.contains(where: { tokenized[$0].count == position }) { break }
 
             let allowed = Set(
-                prefixes.compactMap { tokens -> Int? in
-                    guard position < tokens.count else { return nil }
-                    return tokens[position]
+                prefixes.compactMap { index -> Int? in
+                    guard position < tokenized[index].count else { return nil }
+                    return tokenized[index][position]
                 }
             )
 
@@ -289,12 +301,12 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
             emittedText += text
             try await backend.decode(token)
 
-            prefixes = prefixes.filter { $0.count > position && $0[position] == token }
+            prefixes = prefixes.filter { tokenized[$0].count > position && tokenized[$0][position] == token }
             position += 1
             if prefixes.isEmpty { break }
         }
 
-        return emitted
+        return (emitted, prefixes.first { tokenized[$0].count == position })
     }
 
     private func maxNumberTokens(for node: GenerationSchema.NumberNode) -> Int {
@@ -587,16 +599,15 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
                 all.append(choice)
             }
             var output = try await emit("\"")
-            let value = try await generateChoice(all)
+            let (value, index) = try await generateIndexedChoice(all)
             output += value
             output += try await emit("\"")
-            // The value can differ from every choice when a token's text differs from the
-            // text it was tokenized from, like a piece with a leading space. Narrowing to
-            // no variant would close the object without the remaining required keys, so
-            // the live variants stay as they were.
-            let matching = zip(live, choices).filter { $0.1?.contains(value) == true }.map(\.0)
-            if !matching.isEmpty {
-                live = matching
+            // Narrow by the choice the sampled tokens spell, not by the text they decode to:
+            // the two differ when a token's text differs from the text it was tokenized
+            // from, like a piece with a leading space. Without a choice, the budget ran out
+            // and the live variants stay as they were.
+            if let index {
+                live = zip(live, choices).filter { $0.1?.contains(all[index]) == true }.map(\.0)
             }
             return output
         }
