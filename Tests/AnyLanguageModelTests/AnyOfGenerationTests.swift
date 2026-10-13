@@ -213,6 +213,54 @@ struct AnyOfGenerationTests {
         #expect(try await generate(schema, sampling: queue) == #"{"x":{}}"#)
     }
 
+    @Test(.timeLimit(.minutes(1)))
+    func unionsThatReferToADefinitionTwiceFlattenOnce() async throws {
+        // Each `D` is a union of the next one, twice, so expanding every reference would
+        // list 2^64 variants. Expanding each definition once leaves the integer and string.
+        var defs = (0 ..< 64).map { level in
+            let next = ##"{"$ref": "#/$defs/D\##(level + 1)"}"##
+            return #""D\#(level)": {"anyOf": [\#(next), \#(next)]}"#
+        }
+        defs.append(#""D64": {"type": "integer"}"#)
+        let json = #"""
+            {
+              "$defs": {\#(defs.joined(separator: ","))},
+              "anyOf": [{"$ref": "#/$defs/D0"}, {"type": "string"}]
+            }
+            """#
+        let schema = try JSONDecoder().decode(GenerationSchema.self, from: Data(json.utf8))
+        let queue = [quote, a, quote]
+        #expect(try await generate(schema, sampling: queue) == #""a""#)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func sharedKeysOverADefinitionUsedTwicePerLevelStillCompare() async throws {
+        // Each `N` refers to the next one twice, so resolving every reference to compare
+        // the two `x` schemas would build 2^64 nodes.
+        var defs = (0 ..< 64).map { level in
+            let next = ##"{"$ref": "#/$defs/N\##(level + 1)"}"##
+            let properties = #"{"x": \#(next), "y": \#(next)}"#
+            return #""N\#(level)": {"type": "object", "properties": \#(properties), "required": []}"#
+        }
+        defs.append(#""N64": {"type": "object", "properties": {}, "required": []}"#)
+        let json = #"""
+            {
+              "$defs": {\#(defs.joined(separator: ","))},
+              "anyOf": [
+                {"type": "object", "properties": {"x": {"$ref": "#/$defs/N0"}}, "required": ["x"]},
+                {
+                  "type": "object",
+                  "properties": {"x": {"$ref": "#/$defs/N0"}, "y": {"type": "string"}},
+                  "required": ["x", "y"]
+                }
+              ]
+            }
+            """#
+        let schema = try JSONDecoder().decode(GenerationSchema.self, from: Data(json.utf8))
+        let queue = [quote, x, quote, colon, rightBrace, rightBrace]
+        #expect(try await generate(schema, sampling: queue) == #"{"x":{}}"#)
+    }
+
     @Test func constantGuidedDiscriminatorPicksTheCase() async throws {
         // Since #304 a `.constant(_:)` guide is a one-choice string enum, so it narrows like any other choice.
         let first = DynamicGenerationSchema(

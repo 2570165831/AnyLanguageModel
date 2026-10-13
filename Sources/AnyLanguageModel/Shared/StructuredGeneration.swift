@@ -422,7 +422,7 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
     /// Object variants all start with `{`, so the keys the model emits tell them apart.
     /// Other variants that start alike, like two strings, fall back to the first of them.
     private mutating func generateAnyOf(_ variants: [GenerationSchema.Node]) async throws -> String {
-        let candidates = try flattenedVariants(variants, depth: 0)
+        let candidates = try flattenedVariants(variants)
         guard let first = candidates.first else {
             throw ConstrainedGenerationError.emptyAnyOf
         }
@@ -445,8 +445,20 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
     }
 
     /// Resolves references and flattens nested unions, keeping declaration order.
-    private func flattenedVariants(_ variants: [GenerationSchema.Node], depth: Int) throws -> [GenerationSchema.Node] {
-        guard depth < 64 else { return [] }
+    ///
+    /// Each definition is expanded at most once: a later reference to it, including one
+    /// from inside itself, would only repeat variants already in the list. That keeps the
+    /// result linear in the number of definitions, where expanding every reference would
+    /// double the list at each union that refers to the same definition twice.
+    private func flattenedVariants(_ variants: [GenerationSchema.Node]) throws -> [GenerationSchema.Node] {
+        var expanded = Set<String>()
+        return try flattenedVariants(variants, expanded: &expanded)
+    }
+
+    private func flattenedVariants(
+        _ variants: [GenerationSchema.Node],
+        expanded: inout Set<String>
+    ) throws -> [GenerationSchema.Node] {
         var flattened: [GenerationSchema.Node] = []
         for variant in variants {
             switch variant {
@@ -454,9 +466,10 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
                 guard let referenced = schema.defs[typeName] else {
                     throw ConstrainedGenerationError.missingReference(typeName)
                 }
-                flattened += try flattenedVariants([referenced], depth: depth + 1)
+                guard expanded.insert(typeName).inserted else { continue }
+                flattened += try flattenedVariants([referenced], expanded: &expanded)
             case .anyOf(let nested):
-                flattened += try flattenedVariants(nested, depth: depth + 1)
+                flattened += try flattenedVariants(nested, expanded: &expanded)
             default:
                 flattened.append(variant)
             }
@@ -637,7 +650,7 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
     ) throws -> [(object: GenerationSchema.ObjectNode, owners: [Int])]? {
         var objects: [(object: GenerationSchema.ObjectNode, shape: GenerationSchema.Node, owners: [Int])] = []
         for (position, node) in nodes.enumerated() {
-            let flattened = try flattenedVariants([node], depth: 0)
+            let flattened = try flattenedVariants([node])
             guard !flattened.isEmpty else { return nil }
             for variant in flattened {
                 guard case .object(let object) = variant else { return nil }
@@ -654,22 +667,41 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
         return objects.map { ($0.object, $0.owners) }
     }
 
+    /// How many references one ``withoutDescriptions(_:)`` call resolves before it leaves the
+    /// rest as references.
+    private static var comparableReferenceBudget: Int { 256 }
+
     /// `node` without any descriptions, so nodes that generate the same values compare equal.
     ///
     /// References are resolved, except one already being resolved further up, which stays a
-    /// reference so a recursive definition can't expand forever.
+    /// reference so a recursive definition can't expand forever. Resolution also stops after
+    /// ``comparableReferenceBudget`` references: a definition that refers to another one twice,
+    /// at each level, would otherwise expand exponentially. A reference left unresolved only
+    /// compares equal to the same reference, so two schemas then differ sooner, never later.
+    private func withoutDescriptions(_ node: GenerationSchema.Node) -> GenerationSchema.Node {
+        var budget = Self.comparableReferenceBudget
+        return withoutDescriptions(node, resolving: [], budget: &budget)
+    }
+
     private func withoutDescriptions(
         _ node: GenerationSchema.Node,
-        resolving: Set<String> = []
+        resolving: Set<String>,
+        budget: inout Int
     ) -> GenerationSchema.Node {
         switch node {
         case .object(var object):
             object.description = nil
-            object.properties = object.properties.mapValues { withoutDescriptions($0, resolving: resolving) }
+            for key in object.properties.keys.sorted() {
+                object.properties[key] = withoutDescriptions(
+                    object.properties[key]!,
+                    resolving: resolving,
+                    budget: &budget
+                )
+            }
             return .object(object)
         case .array(var array):
             array.description = nil
-            array.items = withoutDescriptions(array.items, resolving: resolving)
+            array.items = withoutDescriptions(array.items, resolving: resolving, budget: &budget)
             return .array(array)
         case .string(var string):
             string.description = nil
@@ -678,12 +710,17 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
             number.description = nil
             return .number(number)
         case .anyOf(let variants):
-            return .anyOf(variants.map { withoutDescriptions($0, resolving: resolving) })
+            var stripped: [GenerationSchema.Node] = []
+            for variant in variants {
+                stripped.append(withoutDescriptions(variant, resolving: resolving, budget: &budget))
+            }
+            return .anyOf(stripped)
         case .ref(let typeName):
-            guard !resolving.contains(typeName), let referenced = schema.defs[typeName] else {
+            guard budget > 0, !resolving.contains(typeName), let referenced = schema.defs[typeName] else {
                 return node
             }
-            return withoutDescriptions(referenced, resolving: resolving.union([typeName]))
+            budget -= 1
+            return withoutDescriptions(referenced, resolving: resolving.union([typeName]), budget: &budget)
         case .boolean, .null:
             return node
         }
@@ -691,7 +728,7 @@ struct ConstrainedJSONGenerator<Backend: TokenBackend> {
 
     /// The choices of a string enum without a pattern, through references.
     private func stringChoices(of node: GenerationSchema.Node) throws -> [String]? {
-        let flattened = try flattenedVariants([node], depth: 0)
+        let flattened = try flattenedVariants([node])
         guard flattened.count == 1, case .string(let string) = flattened[0], string.pattern == nil,
             let choices = string.enumChoices, !choices.isEmpty
         else { return nil }
